@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import logging
+import os
 import sqlite3
 from typing import Any, Dict, Tuple
 
@@ -19,6 +20,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
+from aiohttp import web
 
 # -----------------------------------------------------------------------------
 # الإعدادات الأساسية
@@ -330,11 +332,26 @@ async def do_broadcast(message: Message, state: FSMContext):
     await message.answer(f"✅ اكتملت الإذاعة. تم التسليم لـ <code>{success_count}</code> مستخدم.", parse_mode=ParseMode.HTML)
 
 # -----------------------------------------------------------------------------
-# نقطة الانطلاق
+# خادم الويب الخاص بـ Render وتشغيل البوت
 # -----------------------------------------------------------------------------
+async def handle_health_check(request):
+    return web.Response(text="Bot is running live on Render!")
+
 async def main():
     logger.info("جاري بدء تشغيل البوت...")
     await bot.delete_webhook(drop_pending_updates=True)
+    
+    # تشغيل خادم الويب الوهمي لإرضاء Render Web Service
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"تم تشغيل خادم الصحة الويب على المنفذ {port}")
+    
+    # بدء استلام رسائل تيليجرام
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
