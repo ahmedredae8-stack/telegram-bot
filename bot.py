@@ -2,9 +2,9 @@ import asyncio
 import datetime
 import logging
 import os
-import sqlite3
 from typing import Any, Dict, Tuple
 
+import psycopg2
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.filters import Command, CommandStart
@@ -27,7 +27,12 @@ from aiohttp import web
 # -----------------------------------------------------------------------------
 BOT_TOKEN = "8917050847:AAE3Ll5CIIv2o3FEXTudTJlnwhua3UOafc4"
 ADMIN_IDS = [7449655663]
-DB_FILE = "production_bot.db"
+
+# رابط الاتصال بقاعدة بيانات Supabase PostgreSQL
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://postgres.xdapebqfdxnmzuuvziqg:Ahmed2010***Reda@aws-0-eu-central-1.pooler.supabase.com:6543/postgres"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,44 +46,45 @@ router = Router()
 dp.include_router(router)
 
 # -----------------------------------------------------------------------------
-# إدارة قاعدة البيانات
+# إدارة قاعدة البيانات (PostgreSQL)
 # -----------------------------------------------------------------------------
 def db_execute(sql: str, params: tuple = (), fetchone: bool = False, fetchall: bool = False, commit: bool = False) -> Any:
-    """مُعالج آمن للتعامل مع قاعدة البيانات مع إغلاق الاتصال أوتوماتيكياً."""
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute(sql, params)
-        if commit:
-            conn.commit()
-        if fetchone:
-            return cursor.fetchone()
-        if fetchall:
-            return cursor.fetchall()
-        return None
+    """مُعالج آمن للتعامل مع قاعدة بيانات Supabase PostgreSQL مع إغلاق الاتصال تلقائياً."""
+    with psycopg2.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql, params)
+            if commit:
+                conn.commit()
+            if fetchone:
+                return cursor.fetchone()
+            if fetchall:
+                return cursor.fetchall()
+            return None
 
 def init_db() -> None:
-    """إنشاء الجداول الأساسية عند بدء التشغيل."""
+    """إنشاء الجداول الأساسية عند بدء التشغيل على Supabase."""
     db_execute('''
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             username TEXT,
             full_name TEXT,
             is_banned INTEGER DEFAULT 0,
             last_sent_date TEXT
-        )
+        );
     ''', commit=True)
     
     db_execute('''
         CREATE TABLE IF NOT EXISTS tickets (
-            ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            ticket_id SERIAL PRIMARY KEY,
+            user_id BIGINT,
             category TEXT,
-            admin_msg_id INTEGER,
+            admin_msg_id BIGINT,
             status TEXT DEFAULT 'OPEN',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
+        );
     ''', commit=True)
 
+# تهيئة الجداول عند التشغيل
 init_db()
 
 # -----------------------------------------------------------------------------
@@ -96,7 +102,7 @@ class AdminStates(StatesGroup):
 # -----------------------------------------------------------------------------
 def get_user_status(user_id: int) -> Dict[str, bool]:
     today = str(datetime.date.today())
-    row = db_execute("SELECT is_banned, last_sent_date FROM users WHERE user_id = ?", (user_id,), fetchone=True)
+    row = db_execute("SELECT is_banned, last_sent_date FROM users WHERE user_id = %s", (user_id,), fetchone=True)
     if not row:
         return {"banned": False, "used_today": False}
     return {
@@ -160,9 +166,9 @@ async def cmd_start(message: Message, state: FSMContext):
     
     db_execute('''
         INSERT INTO users (user_id, username, full_name, last_sent_date) 
-        VALUES (?, ?, ?, '') 
-        ON CONFLICT(user_id) DO UPDATE SET username=?, full_name=?
-    ''', (user.id, user.username, user.full_name, user.username, user.full_name), commit=True)
+        VALUES (%s, %s, %s, '') 
+        ON CONFLICT(user_id) DO UPDATE SET username = EXCLUDED.username, full_name = EXCLUDED.full_name
+    ''', (user.id, user.username, user.full_name), commit=True)
 
     status = get_user_status(user.id)
     text, kb = build_main_menu(user.first_name, user.id, status["used_today"], status["banned"])
@@ -221,11 +227,11 @@ async def process_user_ticket(message: Message, state: FSMContext):
     data = await state.get_data()
     category = data.get("chosen_category", "عام")
     
-    db_execute("INSERT INTO tickets (user_id, category) VALUES (?, ?)", (user.id, category), commit=True)
-    ticket_id = db_execute("SELECT last_insert_rowid()", fetchone=True)[0]
+    # الحصول على ticket_id المولد تلقائياً عبر RETURNING
+    ticket_id = db_execute("INSERT INTO tickets (user_id, category) VALUES (%s, %s) RETURNING ticket_id", (user.id, category), fetchone=True, commit=True)[0]
     
     today = str(datetime.date.today())
-    db_execute("UPDATE users SET last_sent_date = ? WHERE user_id = ?", (today, user.id), commit=True)
+    db_execute("UPDATE users SET last_sent_date = %s WHERE user_id = %s", (today, user.id), commit=True)
     
     user_info = f"👤 <b>المُرسِل:</b> {user.full_name} (@{user.username or 'بدون معرف'})\n🆔 <b>ID:</b> <code>{user.id}</code>"
     header = f"🎫 <b>تذكرة جديدة رقم #{ticket_id}</b>\n🏷 <b>القسم:</b> {category}\n{user_info}\n\n💬 <b>المحتوى:</b>\n"
@@ -242,7 +248,7 @@ async def process_user_ticket(message: Message, state: FSMContext):
                 sent = await bot.send_voice(admin_id, message.voice.file_id, caption=header + (message.caption or ""), reply_markup=get_admin_ticket_keyboard(ticket_id, user.id), parse_mode=ParseMode.HTML)
             
             if 'sent' in locals():
-                db_execute("UPDATE tickets SET admin_msg_id = ? WHERE ticket_id = ?", (sent.message_id, ticket_id), commit=True)
+                db_execute("UPDATE tickets SET admin_msg_id = %s WHERE ticket_id = %s", (sent.message_id, ticket_id), commit=True)
         except Exception as err:
             logger.error(f"Failed to forward ticket #{ticket_id} to admin {admin_id}: {err}")
 
@@ -296,7 +302,7 @@ async def send_admin_reply(message: Message, state: FSMContext):
             f"{message.text}"
         )
         await bot.send_message(target_user_id, reply_payload, parse_mode=ParseMode.HTML)
-        db_execute("UPDATE tickets SET status = 'CLOSED' WHERE ticket_id = ?", (ticket_id,), commit=True)
+        db_execute("UPDATE tickets SET status = 'CLOSED' WHERE ticket_id = %s", (ticket_id,), commit=True)
         await message.answer(f"✅ تم إرسال الرد وإغلاق التذكرة #{ticket_id} بنجاح.")
     except Exception as err:
         logger.error(f"Failed to reply to user {target_user_id}: {err}")
@@ -307,7 +313,7 @@ async def send_admin_reply(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("ban_usr_"), F.from_user.id.in_(ADMIN_IDS))
 async def ban_user_callback(call: CallbackQuery):
     target_user_id = call.data.split("_")[2]
-    db_execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (target_user_id,), commit=True)
+    db_execute("UPDATE users SET is_banned = 1 WHERE user_id = %s", (target_user_id,), commit=True)
     await call.answer("🚫 تم حظر المستخدم بنجاح.", show_alert=True)
 
 @router.message(Command("broadcast"), F.from_user.id.in_(ADMIN_IDS))
